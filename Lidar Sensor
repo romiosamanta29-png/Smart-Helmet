@@ -1,0 +1,157 @@
+#include <HardwareSerial.h>
+
+// ==========================================
+// PIN DEFINITIONS
+// ==========================================
+#define TF_LUNA_RX   18   // ESP32 RX <- TF-Luna TX (pin 3) - confirmed working pin
+#define TF_LUNA_TX   17   // ESP32 TX -> TF-Luna RX (pin 2)
+#define BUZZER_PIN   5
+#define RED_LED_PIN  6
+
+// ==========================================
+// TUNABLE THRESHOLDS
+// ==========================================
+#define MIN_STRENGTH          100    // discard readings weaker than this - unreliable distance
+#define SMOOTH_ALPHA           0.3   // 0-1, how fast the smoothed distance follows raw readings
+#define VELOCITY_WINDOW_MS     150   // only recompute relative velocity this often (reduces noise sensitivity)
+#define REL_VEL_THRESHOLD      0.15  // cm/ms - minimum closing speed to count as "approaching" (tune from testing)
+#define PERSISTENCE_COUNT      3     // require this many consecutive danger readings before alerting
+
+// ==========================================
+// OBJECTS
+// ==========================================
+HardwareSerial LunaSerial(1);
+
+// ==========================================
+// GLOBAL VARIABLES
+// ==========================================
+int distance = 0;
+float smoothedDistance = -1;      // -1 = not yet initialized
+float lastVelDistance = -1;
+unsigned long lastVelTime = 0;
+float relative_velocity = 0;
+int dangerStreak = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RED_LED_PIN, LOW);
+
+  LunaSerial.begin(115200, SERIAL_8N1, TF_LUNA_RX, TF_LUNA_TX);
+  delay(200);
+
+  Serial.println("TF-Luna collision-warning test starting...");
+  Serial.println("---------------------------------------------------");
+}
+
+void loop() {
+  float ttc = checkBlindSpot();
+  triggerAlerts(ttc);
+  delay(20);
+}
+
+// ==========================================
+// SPATIAL AWARENESS & TIME-TO-COLLISION (TTC)
+// ==========================================
+float checkBlindSpot() {
+  static float ttc = 999.0; // persists between calls - only changes when we actually confirm danger/safety
+
+  if (LunaSerial.available() >= 9) {
+    if (LunaSerial.read() == 0x59 && LunaSerial.read() == 0x59) {
+      uint8_t data[7];
+      for (int i = 0; i < 7; i++) {
+        data[i] = LunaSerial.read();
+      }
+
+      uint8_t checksum = 0x59 + 0x59;
+      for (int i = 0; i < 6; i++) {
+        checksum += data[i];
+      }
+      if (checksum != data[6]) {
+        return ttc; // corrupted frame, ignore it entirely
+      }
+
+      distance = data[0] + (data[1] << 8);
+      int strength = data[2] + (data[3] << 8);
+
+      // Reject low-confidence readings (too far, poor reflectivity, edge of range)
+      if (strength < MIN_STRENGTH) {
+        return ttc;
+      }
+
+      // Smooth the distance to reduce frame-to-frame jitter
+      if (smoothedDistance < 0) {
+        smoothedDistance = distance; // first valid reading, initialize
+        lastVelDistance = distance;
+        lastVelTime = millis();
+      } else {
+        smoothedDistance = smoothedDistance * (1.0 - SMOOTH_ALPHA) + distance * SMOOTH_ALPHA;
+      }
+
+      unsigned long currentTime = millis();
+      unsigned long dt = currentTime - lastVelTime;
+
+      // Only recompute velocity every VELOCITY_WINDOW_MS - real motion keeps
+      // accumulating over that window, noise mostly averages out
+      if (dt >= VELOCITY_WINDOW_MS) {
+        relative_velocity = (lastVelDistance - smoothedDistance) / dt; // cm/ms, positive = approaching
+
+        bool isDangerFrame = (relative_velocity > REL_VEL_THRESHOLD);
+
+        if (isDangerFrame) {
+          dangerStreak++;
+        } else {
+          dangerStreak = 0;
+        }
+
+        // Only trust the danger reading once it's persisted across several windows
+        if (dangerStreak >= PERSISTENCE_COUNT) {
+          ttc = (smoothedDistance / relative_velocity) / 1000.0;
+        } else {
+          ttc = 999.0;
+        }
+
+        Serial.print("SmoothDist: ");
+        Serial.print(smoothedDistance, 1);
+        Serial.print(" cm   Strength: ");
+        Serial.print(strength);
+        Serial.print("   RelVel: ");
+        Serial.print(relative_velocity, 4);
+        Serial.print(" cm/ms   Streak: ");
+        Serial.print(dangerStreak);
+        Serial.print("   TTC: ");
+        if (ttc < 999.0) {
+          Serial.print(ttc, 2);
+          Serial.println(" s");
+        } else {
+          Serial.println("-- (safe)");
+        }
+
+        lastVelDistance = smoothedDistance;
+        lastVelTime = currentTime;
+      }
+    }
+  }
+
+  return ttc;
+}
+
+// ==========================================
+// ALERT MANAGER
+// ==========================================
+void triggerAlerts(float ttc) {
+  if (ttc < 1.0 && ttc > 0.0) {
+    digitalWrite(RED_LED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, (millis() / 100) % 2);
+  } else if (ttc <= 1.5 && ttc >= 1.0) {
+    digitalWrite(RED_LED_PIN, (millis() / 250) % 2);
+    digitalWrite(BUZZER_PIN, (millis() / 400) % 2);
+  } else {
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
