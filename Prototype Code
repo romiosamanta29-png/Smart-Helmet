@@ -5,24 +5,34 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-#define IR_SENSOR_PIN      4
+// ==========================================
+// PIN DEFINITIONS
+// ==========================================
+#define IR_SENSOR_AO_PIN   6 
+#define IR_SENSOR_DO_PIN   16
 #define BUZZER_PIN         7
-#define RED_LED_PIN        6
+#define RED_LED_PIN        4
 #define TF_LUNA_RX         18   
 #define TF_LUNA_TX         17
 #define I2C_SDA_PIN        8
 #define I2C_SCL_PIN        9
 #define HELMET_SWITCH_PIN  15  
 
+// ==========================================
+// TF-LUNA NOISE FILTERING
+// ==========================================
 #define MIN_STRENGTH           100   
 #define SMOOTH_ALPHA            0.3   
 #define VELOCITY_WINDOW_MS      150   
 #define REL_VEL_THRESHOLD       0.15  
 #define PERSISTENCE_COUNT       3     
 
-
+// ==========================================
+// THRESHOLDS & CONSTANTS
+// ==========================================
 #define IR_BLINK_THRESHOLD 2100 
 #define EYE_CLOSED_TIME    2000
+#define IR_DO_ACTIVE_STATE LOW
 #define PITCH_SLUMP_THRESH -45   
 
 
@@ -44,6 +54,7 @@ BLECharacteristic* pCharacteristic = NULL;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
+// GLOBAL VARIABLES
 unsigned long eyeClosedStartTime = 0;
 bool isEyeClosed = false;
 bool sosSent = false; 
@@ -53,21 +64,24 @@ int prev_distance = 0;
 unsigned long lastTtcTime = 0;
 float relative_velocity = 0;
 
+// TF-Luna noise filtering state
 float smoothedDistance = -1;     
 float lastVelDistance = -1;
 unsigned long lastVelTime = 0;
 int dangerStreak = 0;
 
+// Adaptive pitch baseline (absorbs slow gyro drift, still catches real slumps)
 float pitchBaseline = 0;
 float pitchBaselineInitial = 0;
 bool baselineInitialized = false;
 
+// Helmet-worn detection (momentary pushbutton - toggles state on each press)
 bool helmetWorn = false;
 bool lastRawButtonState = HIGH;   
 bool buttonStateSettled = HIGH;   
 unsigned long lastButtonChangeTime = 0;
 
-
+// BLE Callbacks to manage connection state
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
@@ -91,6 +105,7 @@ void setup() {
 
   pinMode(HELMET_SWITCH_PIN, INPUT_PULLUP);
 
+  pinMode(IR_SENSOR_DO_PIN, INPUT);
 
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   delay(100);
@@ -113,11 +128,11 @@ void setup() {
   pitchBaselineInitial = pitchBaseline;
   baselineInitialized = true;
 
-  
+  // Initialize TF-Luna
   LunaSerial.begin(115200, SERIAL_8N1, TF_LUNA_RX, TF_LUNA_TX);
 
 
-  
+  // INITIALIZE BLE
   BLEDevice::init("Smart_Helmet_SOS");
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -133,7 +148,7 @@ void setup() {
                     );
 
   pCharacteristic->addDescriptor(new BLE2902());
-  pCharacteristic->setValue("SAFE"); 
+  pCharacteristic->setValue("SAFE"); // Default state
   pService->start();
 
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -149,7 +164,8 @@ void loop() {
   updateHelmetWornState();
 
   if (helmetWorn) {
-    mpu.update();
+    mpu.update(); // refresh MPU readings once per loop, used inside checkRiderHealth()
+
     bool riderIncapacitated = checkRiderHealth();
     float ttc = checkBlindSpot();
 
@@ -160,7 +176,7 @@ void loop() {
     digitalWrite(BUZZER_PIN, LOW);
   }
 
-  
+  // BLE Reconnection handling
   if (!deviceConnected && oldDeviceConnected) {
       delay(500);
       pServer->startAdvertising();
@@ -174,10 +190,14 @@ void loop() {
   delay(20);
 }
 
+// ==========================================
+// 0. HELMET-WORN DETECTION (debounced pushbutton toggle)
+// ==========================================
 void updateHelmetWornState() {
-  bool rawState = digitalRead(HELMET_SWITCH_PIN); 
+  bool rawState = digitalRead(HELMET_SWITCH_PIN); // LOW = currently pressed
+
   if (rawState != lastRawButtonState) {
-    lastButtonChangeTime = millis(); 
+    lastButtonChangeTime = millis(); // reading changed, restart the debounce timer
     lastRawButtonState = rawState;
   }
 
@@ -212,13 +232,19 @@ void updateHelmetWornState() {
   }
 }
 
-
+// ==========================================
+// 1. RIDER HEALTH SUBSYSTEM
+// ==========================================
 bool checkRiderHealth() {
   bool isEmergency = false;
   String alertReason = "";
 
- int irValue = analogRead(IR_SENSOR_PIN);
-  if (irValue > IR_BLINK_THRESHOLD) {
+  // A. Check IR Eye Blink Sensor
+  int irAnalogValue = analogRead(IR_SENSOR_AO_PIN);
+  bool irDigitalTriggered = (digitalRead(IR_SENSOR_DO_PIN) == IR_DO_ACTIVE_STATE);
+  bool irAnalogTriggered = (irAnalogValue > IR_BLINK_THRESHOLD);
+  bool irTriggered = irAnalogTriggered || irDigitalTriggered;
+  if (irTriggered) {
     if (!isEyeClosed) {
       isEyeClosed = true;
       eyeClosedStartTime = millis();
@@ -241,7 +267,7 @@ bool checkRiderHealth() {
   if (pitchDelta < PITCH_SLUMP_THRESH) {
     isEmergency = true;
     alertReason = "HEAD_SLUMP";
-  } else if (gForce > 3.0) { 
+  } else if (gForce > 3.0) { // Example: 3G threshold for a crash
     isEmergency = true;
     alertReason = "CRASH_DETECTED";
   }
@@ -257,11 +283,13 @@ bool checkRiderHealth() {
     }
   }
 
-if (isEmergency && !sosSent) {
+  // If an emergency is detected and we haven't sent the flag to the app yet
+  if (isEmergency && !sosSent) {
     Serial.println("ALERT: " + alertReason);
     sendBLEAlert(alertReason);
     sosSent = true;
   }
+  // Reset the flag if the rider recovers and returns to a safe state
   else if (!isEmergency && sosSent) {
     pCharacteristic->setValue("SAFE");
     pCharacteristic->notify();
@@ -271,15 +299,20 @@ if (isEmergency && !sosSent) {
   return isEmergency;
 }
 
+// ==========================================
+// 2. SEND BLE ALERT TO APP
+// ==========================================
 void sendBLEAlert(String message) {
   if (deviceConnected) {
     pCharacteristic->setValue(message.c_str());
-    pCharacteristic->notify(); 
+    pCharacteristic->notify(); // Pushes the emergency flag to the app immediately
     Serial.println("Sent emergency flag to Road SOS App!");
   }
 }
 
-
+// ==========================================
+// 3. SPATIAL AWARENESS & TIME-TO-COLLISION (TTC)
+// ==========================================
 float checkBlindSpot() {
   static float ttc = 999.0; 
   if (LunaSerial.available() >= 9) {
@@ -300,12 +333,14 @@ float checkBlindSpot() {
       distance = data[0] + (data[1] << 8);
       int strength = data[2] + (data[3] << 8);
 
+      // Reject low-confidence readings (too far, poor reflectivity, edge of range)
       if (strength < MIN_STRENGTH) {
         return ttc;
       }
 
+      // Smooth the distance to reduce frame-to-frame jitter
       if (smoothedDistance < 0) {
-        smoothedDistance = distance; 
+        smoothedDistance = distance; // first valid reading, initialize
         lastVelDistance = distance;
         lastVelTime = millis();
       } else {
@@ -316,7 +351,7 @@ float checkBlindSpot() {
       unsigned long dt = currentTime - lastVelTime;
 
       if (dt >= VELOCITY_WINDOW_MS) {
-        relative_velocity = (lastVelDistance - smoothedDistance) / dt; 
+        relative_velocity = (lastVelDistance - smoothedDistance) / dt; // cm/ms, positive = approaching
 
         bool isDangerFrame = (relative_velocity > REL_VEL_THRESHOLD);
         dangerStreak = isDangerFrame ? (dangerStreak + 1) : 0;
@@ -338,7 +373,9 @@ float checkBlindSpot() {
   return ttc;
 }
 
- 4. ALERT MANAGER
+// ==========================================
+// 4. ALERT MANAGER
+// ==========================================
 void triggerAlerts(bool healthEmergency, float ttc) {
   if (healthEmergency) {
     digitalWrite(RED_LED_PIN, HIGH);
@@ -356,4 +393,3 @@ void triggerAlerts(bool healthEmergency, float ttc) {
     digitalWrite(RED_LED_PIN, LOW);
     digitalWrite(BUZZER_PIN, LOW);
   }
-}
