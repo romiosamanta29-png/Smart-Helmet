@@ -1,35 +1,21 @@
-// TCRT5000 IR Sensor Test Code for ESP32-S3
-
-// Pin Definitions
-const int digitalPin = 4; // Connect D0 to GPIO 4
-const int analogPin = 5;  // Connect A0 to GPIO 5 (ADC pin)
+const int digitalPin = 4; 
+const int analogPin = 5; 
 
 void setup() {
-  // Initialize Serial Monitor at 115200 baud rate (standard for ESP32)
   Serial.begin(115200);
   
-  // Wait briefly for native USB serial to connect (if your board uses it)
   delay(1000); 
 
-  // Configure the sensor pin as an input
   pinMode(digitalPin, INPUT);
   
   Serial.println("ESP32-S3 TCRT5000 Sensor Test Started!");
 }
 
 void loop() {
-  // Read the digital value (1 or 0)
-  // Usually: 1 (HIGH) = No reflection (black line or empty space)
-  //          0 (LOW)  = Reflection detected (white surface or object close)
   int digitalValue = digitalRead(digitalPin);
+ int analogValue = analogRead(analogPin);
 
-  // Read the raw analog value
-  // ESP32-S3 ADC is 12-bit, so this value ranges from 0 to 4095
-  // Lower values = strong reflection, Higher values = weak/no reflection
-  int analogValue = analogRead(analogPin);
-
-  // Print results to the Serial Monitor
-  Serial.print("Digital State: ");
+   Serial.print("Digital State: ");
   if (digitalValue == HIGH) {
     Serial.print("HIGH (No Reflection) ");
   } else {
@@ -39,6 +25,5 @@ void loop() {
   Serial.print("| Analog Reading: ");
   Serial.println(analogValue);
 
-  // Small delay to make the Serial Monitor readable
   delay(100);
 }
