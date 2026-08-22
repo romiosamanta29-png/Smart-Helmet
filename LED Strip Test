@@ -1,0 +1,52 @@
+#define LED_STRIP_PIN 4
+#define PWM_FREQ      500
+#define PWM_RES       8
+
+// Helper function to handle inverted logic
+void setBrightness(uint8_t brightness) {
+  // brightness: 0 (OFF) to 255 (Full 100% Brightness)
+  ledcWrite(LED_STRIP_PIN, 255 - brightness);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  ledcAttach(LED_STRIP_PIN, PWM_FREQ, PWM_RES);
+
+  // Start with LEDs OFF
+  setBrightness(0);
+  delay(1000);
+}
+
+void loop() {
+  Serial.println("Brightness: 25%");
+  setBrightness(64);
+  delay(1500);
+
+  Serial.println("Brightness: 50%");
+  setBrightness(128);
+  delay(1500);
+
+  Serial.println("Brightness: 75%");
+  setBrightness(191);
+  delay(1500);
+
+  Serial.println("Brightness: 100% (Full Power)");
+  setBrightness(255);
+  delay(2000);
+
+  Serial.println("Brightness: OFF");
+  setBrightness(0);
+  delay(1000);
+
+  // Smooth fade
+  for (int b = 0; b <= 255; b++) {
+    setBrightness(b);
+    delay(8);
+  }
+  for (int b = 255; b >= 0; b--) {
+    setBrightness(b);
+    delay(8);
+  }
+  delay(1000);
+}
