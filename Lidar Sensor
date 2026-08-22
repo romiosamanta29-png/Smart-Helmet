@@ -1,32 +1,22 @@
 #include <HardwareSerial.h>
 
-// ==========================================
-// PIN DEFINITIONS
-// ==========================================
-#define TF_LUNA_RX   18   // ESP32 RX <- TF-Luna TX (pin 3) - confirmed working pin
-#define TF_LUNA_TX   17   // ESP32 TX -> TF-Luna RX (pin 2)
+
+#define TF_LUNA_RX   18   
+#define TF_LUNA_TX   17   
 #define BUZZER_PIN   5
 #define RED_LED_PIN  6
+#define MIN_STRENGTH          100    
+#define SMOOTH_ALPHA           0.3   
+#define VELOCITY_WINDOW_MS     150   
+#define REL_VEL_THRESHOLD      0.15 
+#define PERSISTENCE_COUNT      3   
 
-// ==========================================
-// TUNABLE THRESHOLDS
-// ==========================================
-#define MIN_STRENGTH          100    // discard readings weaker than this - unreliable distance
-#define SMOOTH_ALPHA           0.3   // 0-1, how fast the smoothed distance follows raw readings
-#define VELOCITY_WINDOW_MS     150   // only recompute relative velocity this often (reduces noise sensitivity)
-#define REL_VEL_THRESHOLD      0.15  // cm/ms - minimum closing speed to count as "approaching" (tune from testing)
-#define PERSISTENCE_COUNT      3     // require this many consecutive danger readings before alerting
 
-// ==========================================
-// OBJECTS
-// ==========================================
 HardwareSerial LunaSerial(1);
 
-// ==========================================
-// GLOBAL VARIABLES
-// ==========================================
+
 int distance = 0;
-float smoothedDistance = -1;      // -1 = not yet initialized
+float smoothedDistance = -1;     
 float lastVelDistance = -1;
 unsigned long lastVelTime = 0;
 float relative_velocity = 0;
@@ -54,12 +44,9 @@ void loop() {
   delay(20);
 }
 
-// ==========================================
-// SPATIAL AWARENESS & TIME-TO-COLLISION (TTC)
-// ==========================================
-float checkBlindSpot() {
-  static float ttc = 999.0; // persists between calls - only changes when we actually confirm danger/safety
 
+float checkBlindSpot() {
+  static float ttc = 999.0;
   if (LunaSerial.available() >= 9) {
     if (LunaSerial.read() == 0x59 && LunaSerial.read() == 0x59) {
       uint8_t data[7];
@@ -72,7 +59,7 @@ float checkBlindSpot() {
         checksum += data[i];
       }
       if (checksum != data[6]) {
-        return ttc; // corrupted frame, ignore it entirely
+        return ttc; 
       }
 
       distance = data[0] + (data[1] << 8);
@@ -85,7 +72,7 @@ float checkBlindSpot() {
 
       // Smooth the distance to reduce frame-to-frame jitter
       if (smoothedDistance < 0) {
-        smoothedDistance = distance; // first valid reading, initialize
+        smoothedDistance = distance;
         lastVelDistance = distance;
         lastVelTime = millis();
       } else {
@@ -95,10 +82,8 @@ float checkBlindSpot() {
       unsigned long currentTime = millis();
       unsigned long dt = currentTime - lastVelTime;
 
-      // Only recompute velocity every VELOCITY_WINDOW_MS - real motion keeps
-      // accumulating over that window, noise mostly averages out
-      if (dt >= VELOCITY_WINDOW_MS) {
-        relative_velocity = (lastVelDistance - smoothedDistance) / dt; // cm/ms, positive = approaching
+     if (dt >= VELOCITY_WINDOW_MS) {
+        relative_velocity = (lastVelDistance - smoothedDistance) / dt;
 
         bool isDangerFrame = (relative_velocity > REL_VEL_THRESHOLD);
 
@@ -108,8 +93,7 @@ float checkBlindSpot() {
           dangerStreak = 0;
         }
 
-        // Only trust the danger reading once it's persisted across several windows
-        if (dangerStreak >= PERSISTENCE_COUNT) {
+         if (dangerStreak >= PERSISTENCE_COUNT) {
           ttc = (smoothedDistance / relative_velocity) / 1000.0;
         } else {
           ttc = 999.0;
@@ -133,25 +117,3 @@ float checkBlindSpot() {
 
         lastVelDistance = smoothedDistance;
         lastVelTime = currentTime;
-      }
-    }
-  }
-
-  return ttc;
-}
-
-// ==========================================
-// ALERT MANAGER
-// ==========================================
-void triggerAlerts(float ttc) {
-  if (ttc < 1.0 && ttc > 0.0) {
-    digitalWrite(RED_LED_PIN, HIGH);
-    digitalWrite(BUZZER_PIN, (millis() / 100) % 2);
-  } else if (ttc <= 1.5 && ttc >= 1.0) {
-    digitalWrite(RED_LED_PIN, (millis() / 250) % 2);
-    digitalWrite(BUZZER_PIN, (millis() / 400) % 2);
-  } else {
-    digitalWrite(RED_LED_PIN, LOW);
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-}
