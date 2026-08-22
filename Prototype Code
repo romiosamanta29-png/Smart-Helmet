@@ -1,0 +1,359 @@
+#include <Wire.h>
+#include <MPU6050_light.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define IR_SENSOR_PIN      4
+#define BUZZER_PIN         7
+#define RED_LED_PIN        6
+#define TF_LUNA_RX         18   
+#define TF_LUNA_TX         17
+#define I2C_SDA_PIN        8
+#define I2C_SCL_PIN        9
+#define HELMET_SWITCH_PIN  15  
+
+#define MIN_STRENGTH           100   
+#define SMOOTH_ALPHA            0.3   
+#define VELOCITY_WINDOW_MS      150   
+#define REL_VEL_THRESHOLD       0.15  
+#define PERSISTENCE_COUNT       3     
+
+
+#define IR_BLINK_THRESHOLD 2100 
+#define EYE_CLOSED_TIME    2000
+#define PITCH_SLUMP_THRESH -45   
+
+
+#define BASELINE_ALPHA        0.0005  
+#define BASELINE_MAX_DRIFT    20.0    
+
+#define SWITCH_DEBOUNCE_MS    50   
+
+
+#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+
+MPU6050 mpu(Wire);
+HardwareSerial LunaSerial(1);
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+unsigned long eyeClosedStartTime = 0;
+bool isEyeClosed = false;
+bool sosSent = false; 
+
+int distance = 0;
+int prev_distance = 0;
+unsigned long lastTtcTime = 0;
+float relative_velocity = 0;
+
+float smoothedDistance = -1;     
+float lastVelDistance = -1;
+unsigned long lastVelTime = 0;
+int dangerStreak = 0;
+
+float pitchBaseline = 0;
+float pitchBaselineInitial = 0;
+bool baselineInitialized = false;
+
+bool helmetWorn = false;
+bool lastRawButtonState = HIGH;   
+bool buttonStateSettled = HIGH;   
+unsigned long lastButtonChangeTime = 0;
+
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("App Connected via BLE!");
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("App Disconnected!");
+    }
+};
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RED_LED_PIN, LOW);
+
+  pinMode(HELMET_SWITCH_PIN, INPUT_PULLUP);
+
+
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  delay(100);
+
+  Serial.println("Checking MPU6050/6500...");
+  byte status = mpu.begin();
+  if (status != 0) {
+    Serial.println("Failed to find MPU chip");
+    while (1) { delay(10); }
+  }
+  Serial.println("MPU FOUND!");
+
+  Serial.println("Calculating offsets, keep helmet still...");
+  delay(1000);
+  mpu.calcOffsets(); 
+  Serial.println("MPU ready.");
+
+  mpu.update();
+  pitchBaseline = mpu.getAngleY();
+  pitchBaselineInitial = pitchBaseline;
+  baselineInitialized = true;
+
+  
+  LunaSerial.begin(115200, SERIAL_8N1, TF_LUNA_RX, TF_LUNA_TX);
+
+
+  
+  BLEDevice::init("Smart_Helmet_SOS");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ   |
+                      BLECharacteristic::PROPERTY_WRITE  |
+                      BLECharacteristic::PROPERTY_NOTIFY |
+                      BLECharacteristic::PROPERTY_INDICATE
+                    );
+
+  pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setValue("SAFE"); 
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(false);
+  pAdvertising->setMinPreferred(0x0);
+  BLEDevice::startAdvertising();
+
+  Serial.println("Smart Helmet Initialized. Waiting for BLE connection...");
+}
+
+void loop() {
+  updateHelmetWornState();
+
+  if (helmetWorn) {
+    mpu.update();
+    bool riderIncapacitated = checkRiderHealth();
+    float ttc = checkBlindSpot();
+
+    triggerAlerts(riderIncapacitated, ttc);
+  } else {
+
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  
+  if (!deviceConnected && oldDeviceConnected) {
+      delay(500);
+      pServer->startAdvertising();
+      Serial.println("Restarting BLE advertising...");
+      oldDeviceConnected = deviceConnected;
+  }
+  if (deviceConnected && !oldDeviceConnected) {
+      oldDeviceConnected = deviceConnected;
+  }
+
+  delay(20);
+}
+
+void updateHelmetWornState() {
+  bool rawState = digitalRead(HELMET_SWITCH_PIN); 
+  if (rawState != lastRawButtonState) {
+    lastButtonChangeTime = millis(); 
+    lastRawButtonState = rawState;
+  }
+
+
+  if ((millis() - lastButtonChangeTime) > SWITCH_DEBOUNCE_MS && rawState != buttonStateSettled) {
+    buttonStateSettled = rawState;
+
+    if (buttonStateSettled == LOW) {
+      helmetWorn = !helmetWorn;
+
+      if (helmetWorn) {
+        Serial.println("Button pressed - helmet marked WORN, sensors active.");
+        mpu.update();
+        pitchBaseline = mpu.getAngleY();
+        pitchBaselineInitial = pitchBaseline;
+        isEyeClosed = false;
+        sosSent = false;
+        prev_distance = 0;       
+        smoothedDistance = -1;   
+        dangerStreak = 0;
+      } else {
+        Serial.println("Button pressed - helmet marked NOT WORN, sensors paused.");
+        digitalWrite(RED_LED_PIN, LOW);
+        digitalWrite(BUZZER_PIN, LOW);
+        if (sosSent) {
+          pCharacteristic->setValue("SAFE");
+          pCharacteristic->notify();
+          sosSent = false;
+        }
+      }
+    }
+  }
+}
+
+
+bool checkRiderHealth() {
+  bool isEmergency = false;
+  String alertReason = "";
+
+ int irValue = analogRead(IR_SENSOR_PIN);
+  if (irValue > IR_BLINK_THRESHOLD) {
+    if (!isEyeClosed) {
+      isEyeClosed = true;
+      eyeClosedStartTime = millis();
+    } else if (millis() - eyeClosedStartTime > EYE_CLOSED_TIME) {
+      isEmergency = true;
+      alertReason = "MICROSLEEP";
+    }
+  } else {
+    isEyeClosed = false;
+  }
+
+  
+  float pitch = mpu.getAngleY(); 
+
+  float gForce = sqrt(sq(mpu.getAccX()) + sq(mpu.getAccY()) + sq(mpu.getAccZ()));
+
+ 
+  float pitchDelta = pitch - pitchBaseline;
+
+  if (pitchDelta < PITCH_SLUMP_THRESH) {
+    isEmergency = true;
+    alertReason = "HEAD_SLUMP";
+  } else if (gForce > 3.0) { 
+    isEmergency = true;
+    alertReason = "CRASH_DETECTED";
+  }
+
+ 
+  if (!isEmergency) {
+    pitchBaseline += (pitch - pitchBaseline) * BASELINE_ALPHA;
+
+    if (pitchBaseline > pitchBaselineInitial + BASELINE_MAX_DRIFT) {
+      pitchBaseline = pitchBaselineInitial + BASELINE_MAX_DRIFT;
+    } else if (pitchBaseline < pitchBaselineInitial - BASELINE_MAX_DRIFT) {
+      pitchBaseline = pitchBaselineInitial - BASELINE_MAX_DRIFT;
+    }
+  }
+
+if (isEmergency && !sosSent) {
+    Serial.println("ALERT: " + alertReason);
+    sendBLEAlert(alertReason);
+    sosSent = true;
+  }
+  else if (!isEmergency && sosSent) {
+    pCharacteristic->setValue("SAFE");
+    pCharacteristic->notify();
+    sosSent = false;
+  }
+
+  return isEmergency;
+}
+
+void sendBLEAlert(String message) {
+  if (deviceConnected) {
+    pCharacteristic->setValue(message.c_str());
+    pCharacteristic->notify(); 
+    Serial.println("Sent emergency flag to Road SOS App!");
+  }
+}
+
+
+float checkBlindSpot() {
+  static float ttc = 999.0; 
+  if (LunaSerial.available() >= 9) {
+    if (LunaSerial.read() == 0x59 && LunaSerial.read() == 0x59) {
+      uint8_t data[7];
+      for (int i = 0; i < 7; i++) {
+        data[i] = LunaSerial.read();
+      }
+
+      uint8_t checksum = 0x59 + 0x59;
+      for (int i = 0; i < 6; i++) {
+        checksum += data[i];
+      }
+      if (checksum != data[6]) {
+        return ttc; 
+      }
+
+      distance = data[0] + (data[1] << 8);
+      int strength = data[2] + (data[3] << 8);
+
+      if (strength < MIN_STRENGTH) {
+        return ttc;
+      }
+
+      if (smoothedDistance < 0) {
+        smoothedDistance = distance; 
+        lastVelDistance = distance;
+        lastVelTime = millis();
+      } else {
+        smoothedDistance = smoothedDistance * (1.0 - SMOOTH_ALPHA) + distance * SMOOTH_ALPHA;
+      }
+
+      unsigned long currentTime = millis();
+      unsigned long dt = currentTime - lastVelTime;
+
+      if (dt >= VELOCITY_WINDOW_MS) {
+        relative_velocity = (lastVelDistance - smoothedDistance) / dt; 
+
+        bool isDangerFrame = (relative_velocity > REL_VEL_THRESHOLD);
+        dangerStreak = isDangerFrame ? (dangerStreak + 1) : 0;
+
+        if (dangerStreak >= PERSISTENCE_COUNT) {
+          ttc = (smoothedDistance / relative_velocity) / 1000.0;
+        } else {
+          ttc = 999.0;
+        }
+
+        lastVelDistance = smoothedDistance;
+        lastVelTime = currentTime;
+      }
+
+      prev_distance = distance;
+      lastTtcTime = currentTime;
+    }
+  }
+  return ttc;
+}
+
+ 4. ALERT MANAGER
+void triggerAlerts(bool healthEmergency, float ttc) {
+  if (healthEmergency) {
+    digitalWrite(RED_LED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+  }
+  else if (ttc < 1.0 && ttc > 0.0) {
+    digitalWrite(RED_LED_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, (millis() / 100) % 2);
+  }
+  else if (ttc <= 1.5 && ttc >= 1.0) {
+    digitalWrite(RED_LED_PIN, (millis() / 250) % 2);
+    digitalWrite(BUZZER_PIN, (millis() / 400) % 2);
+  }
+  else {
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
