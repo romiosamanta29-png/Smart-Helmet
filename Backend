@@ -11,10 +11,10 @@ from typing import List, Dict
 # --- TWILIO SMS SETUP ---
 from twilio.rest import Client
 
-TWILIO_SID = "AC43adb8841ccda45621d00de96eccf225"
-TWILIO_AUTH_TOKEN = "062b7a1f066467848ad3fd431fafd12b"
-TWILIO_SANDBOX_NUMBER = "+14155238886" 
-MOM_PHONE_NUMBER = "+919007790943"   
+TWILIO_SID = ""
+TWILIO_AUTH_TOKEN = ""
+TWILIO_SANDBOX_NUMBER = "" 
+MOM_PHONE_NUMBER = ""   
 
 def send_emergency_sms(gps_coords):
     """Sends a real WhatsApp alert with a Google Maps link to the emergency contact."""
