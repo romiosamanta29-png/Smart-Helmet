@@ -1,0 +1,184 @@
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+import numpy as np
+import networkx as nx
+import random
+from typing import List, Dict
+
+# --- TWILIO SMS SETUP ---
+from twilio.rest import Client
+
+TWILIO_SID = "AC43adb8841ccda45621d00de96eccf225"
+TWILIO_AUTH_TOKEN = "062b7a1f066467848ad3fd431fafd12b"
+TWILIO_SANDBOX_NUMBER = "+14155238886" 
+MOM_PHONE_NUMBER = "+919007790943"   
+
+def send_emergency_sms(gps_coords):
+    """Sends a real WhatsApp alert with a Google Maps link to the emergency contact."""
+    try:
+        if TWILIO_SID == "":
+            print("[Warning] Twilio credentials not set. Skipping SMS dispatch.")
+            return
+
+        client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
+        
+        # Build the URL dynamically to prevent link scrambling
+        base_url = "https://www." + "google.com/maps"
+        maps_link = f"{base_url}?q={gps_coords[0]},{gps_coords[1]}"
+        
+        msg = client.messages.create(
+            body=f"🚨 EMERGENCY ALERT: RoadSoS detected a severe vehicle crash. Immediate assistance required. Live location: {maps_link}",
+            from_=f"whatsapp:{TWILIO_SANDBOX_NUMBER}", 
+            to=f"whatsapp:{MOM_PHONE_NUMBER}"          
+        )
+        print(f"\n[SUCCESS] WhatsApp Alert Sent! Message SID: {msg.sid}")
+    except Exception as e:
+        print(f"\n[ERROR] Failed to send WhatsApp: {e}")
+
+# --- FASTAPI APP INITIALIZATION ---
+app = FastAPI(title="RoadSoS AI Dispatch Engine", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- MOCK DATABASES & SPATIAL DATA ---
+EMERGENCY_RESOURCES = {
+    "ambulances": [
+        {"id": "AMB_01", "loc": (12.9716, 77.5946), "status": "available"},
+        {"id": "AMB_02", "loc": (12.9910, 77.5712), "status": "available"},
+        {"id": "AMB_03", "loc": (12.9352, 77.6245), "status": "busy"}
+    ],
+    "trauma_centers": [
+        {"name": "Apollo Trauma Care", "loc": (12.9611, 77.6384), "specialty": "Level 1 polytrauma"},
+        {"name": "Fortis Emergency Hospital", "loc": (12.9224, 77.5982), "specialty": "Level 2 trauma"}
+    ],
+    "police_stations": [
+        {"station": "Central Traffic Police Base", "loc": (12.9780, 77.5910)}
+    ]
+}
+
+# Generate a mock city traffic grid graph for route optimization
+city_graph = nx.grid_2d_graph(5, 5) 
+mapping = {node: i for i, node in enumerate(city_graph.nodes())}
+city_graph = nx.relabel_nodes(city_graph, mapping)
+
+for u, v in city_graph.edges():
+    base_dist = round(random.uniform(1.2, 3.5), 2)  
+    traffic_congestion_factor = round(random.uniform(1.0, 3.5), 2)  
+    city_graph[u][v]['weight'] = base_dist * traffic_congestion_factor
+
+# --- PYDANTIC DATA MODELS ---
+class SensorTelemetry(BaseModel):
+    device_id: str
+    gps_coordinates: List[float] 
+    accelerometer: List[float]   
+    gyroscope: List[float]       
+    microphone_db: float         
+    audio_peak_frequency: float  
+
+# --- AI & ROUTING HELPER FUNCTIONS ---
+def ai_crash_classifier(accel: List[float], gyro: List[float], db: float, freq: float) -> float:
+    """Hackathon Demo Version: Triggers based on > 2.5 G-force"""
+    g_force = np.sqrt(accel[0]**2 + accel[1]**2 + accel[2]**2)
+    if g_force >= 2.5: 
+        return 0.85 
+    return 0.10
+
+def haversine_distance(coord1, coord2):
+    """Calculates geographical distance between two coordinates in km."""
+    R = 6371.0
+    lat1, lon1 = np.radians(coord1[0]), np.radians(coord1[1])
+    lat2, lon2 = np.radians(coord2[0]), np.radians(coord2[1])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    return R * c
+
+def find_nearest_resource(accident_loc: List[float], resource_list: List[Dict]) -> Dict:
+    """Finds the spatially closest emergency asset."""
+    nearest = min(resource_list, key=lambda x: haversine_distance(accident_loc, x['loc']))
+    return nearest
+
+def optimize_emergency_route(start_node: int, end_node: int):
+    """Runs Dijkstra's algorithm to compute the fastest traffic route."""
+    try:
+        path = nx.shortest_path(city_graph, source=start_node, target=end_node, weight='weight')
+        total_cost = nx.shortest_path_length(city_graph, source=start_node, target=end_node, weight='weight')
+        return {"path_intersections": path, "estimated_travel_time_score": round(total_cost, 2)}
+    except nx.NetworkXNoPath:
+        return {"path_intersections": [], "estimated_travel_time_score": float('inf')}
+
+# --- API ROUTE ENDPOINTS ---
+@app.get("/", response_class=HTMLResponse)
+async def mobile_app():
+    with open("index.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+@app.post("/api/v1/telemetry/analyze")
+async def analyze_telemetry(data: SensorTelemetry):
+    crash_probability = ai_crash_classifier(
+        data.accelerometer, data.gyroscope, data.microphone_db, data.audio_peak_frequency
+    )
+    is_accident = crash_probability >= 0.75
+    
+    return {
+        "device_id": data.device_id,
+        "crash_probability": crash_probability,
+        "action_required": "TRIGGER_COUNTDOWN" if is_accident else "MONITOR"
+    }
+
+@app.post("/api/v1/emergency/dispatch")
+async def dispatch_emergency_services(accident_report: Dict):
+    accident_loc = accident_report.get("gps_coordinates")
+    if not accident_loc or len(accident_loc) != 2:
+        raise HTTPException(status_code=400, detail="Invalid GPS coordinates supplied.")
+        
+    available_ambulances = [a for a in EMERGENCY_RESOURCES["ambulances"] if a["status"] == "available"]
+    
+    # Failsafe: Reset fleet if all ambulances are busy
+    if not available_ambulances:
+        for amb in EMERGENCY_RESOURCES["ambulances"]:
+            amb["status"] = "available"
+        available_ambulances = EMERGENCY_RESOURCES["ambulances"]
+        
+    best_ambulance = find_nearest_resource(accident_loc, available_ambulances)
+    best_trauma_center = find_nearest_resource(accident_loc, EMERGENCY_RESOURCES["trauma_centers"])
+    best_police = find_nearest_resource(accident_loc, EMERGENCY_RESOURCES["police_stations"])
+    
+    accident_node = random.randint(0, 8)
+    ambulance_node = random.randint(9, 16)
+    trauma_node = random.randint(17, 24)
+    
+    ambulance_to_accident_route = optimize_emergency_route(ambulance_node, accident_node)
+    accident_to_hospital_route = optimize_emergency_route(accident_node, trauma_node)
+    
+    for amb in EMERGENCY_RESOURCES["ambulances"]:
+        if amb["id"] == best_ambulance["id"]:
+            amb["status"] = "dispatched"
+            
+    # FIRE WHATSAPP ALERT
+    send_emergency_sms(accident_loc)
+            
+    return {
+        "status": "SOS_DISPATCH_ACTIVATED",
+        "incident_log": {
+            "allocated_ambulance": best_ambulance,
+            "allocated_trauma_center": best_trauma_center,
+            "notified_police_precinct": best_police
+        },
+        "traffic_optimized_routing": {
+            "ambulance_dispatch_path": ambulance_to_accident_route,
+            "hospital_transit_path": accident_to_hospital_route
+        }
+    }
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
