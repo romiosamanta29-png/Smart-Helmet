@@ -5,7 +5,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-#define IR_SENSOR_AO_PIN   4
+#define IR_SENSOR_AO_PIN   6
 #define IR_SENSOR_DO_PIN   16
 #define BUZZER_PIN         7
 #define RED_LED_PIN        4
@@ -120,6 +120,7 @@ void setup() {
   LunaSerial.setRxBufferSize(1024);
   LunaSerial.begin(115200, SERIAL_8N1, TF_LUNA_RX, TF_LUNA_TX);
 
+  // Initialize BLE
   BLEDevice::init("Smart_Helmet_SOS");
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
@@ -138,10 +139,12 @@ void setup() {
   pCharacteristic->setValue("SAFE");
   pService->start();
 
+  // Advertising setup for Web Bluetooth discovery
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(false);
-  pAdvertising->setMinPreferred(0x0);
+  pAdvertising->setScanResponse(true);                 // Enable scan response
+  pAdvertising->setMinPreferred(0x06);                 // Helps iPhone / Chrome connection
+  pAdvertising->setMaxPreferred(0x12);
   BLEDevice::startAdvertising();
 
   Serial.println("Smart Helmet Initialized. Waiting for BLE connection...");
@@ -218,39 +221,46 @@ void updateHelmetWornState() {
 // 1. RIDER HEALTH SUBSYSTEM
 // ==========================================
 bool checkRiderHealth() {
-  bool isEmergency = false;
-  String alertReason = "";
+  bool localWarning = false;
+  bool isCrash = false;
 
+  // --- Drowsiness Check (IR Sensor) ---
   int irAnalogValue = analogRead(IR_SENSOR_AO_PIN);
-  bool irDigitalTriggered = (digitalRead(IR_SENSOR_DO_PIN) == IR_DO_ACTIVE_STATE);
-  bool irAnalogTriggered = (irAnalogValue > IR_BLINK_THRESHOLD);
-  bool irTriggered = irAnalogTriggered || irDigitalTriggered;
+  bool irAnalogTriggered = (irAnalogValue < IR_BLINK_THRESHOLD);
 
-  if (irTriggered) {
+  if (irAnalogTriggered) {
     if (!isEyeClosed) {
       isEyeClosed = true;
       eyeClosedStartTime = millis();
     } else if (millis() - eyeClosedStartTime > EYE_CLOSED_TIME) {
-      isEmergency = true;
-      alertReason = "MICROSLEEP";
+      localWarning = true; // Microsleep triggers local buzzer/LED only
     }
   } else {
     isEyeClosed = false;
   }
 
+  // --- IMU / Fall / Crash Check ---
   float pitch = mpu.getAngleY();
-  float gForce = sqrt(sq(mpu.getAccX()) + sq(mpu.getAccY()) + sq(mpu.getAccZ()));
+  float ax = mpu.getAccX();
+  float ay = mpu.getAccY();
+  float az = mpu.getAccZ();
+
+  float gForce = sqrt(ax * ax + ay * ay + az * az);
+
+
   float pitchDelta = pitch - pitchBaseline;
 
   if (pitchDelta < PITCH_SLUMP_THRESH) {
-    isEmergency = true;
-    alertReason = "HEAD_SLUMP";
-  } else if (gForce > 3.0) {
-    isEmergency = true;
-    alertReason = "CRASH_DETECTED";
+    localWarning = true; // Head slump triggers local buzzer/LED only
   }
 
-  if (!isEmergency) {
+  // ONLY High G-Force triggers Crash SOS
+  if (gForce > 3.0) {
+    isCrash = true;
+  }
+
+  // Update dynamic baseline drift if no slump/crash
+  if (!localWarning && !isCrash) {
     pitchBaseline += (pitch - pitchBaseline) * BASELINE_ALPHA;
     if (pitchBaseline > pitchBaselineInitial + BASELINE_MAX_DRIFT) {
       pitchBaseline = pitchBaselineInitial + BASELINE_MAX_DRIFT;
@@ -259,18 +269,21 @@ bool checkRiderHealth() {
     }
   }
 
-  if (isEmergency && !sosSent) {
-    Serial.println("ALERT: " + alertReason);
-    sendBLEAlert(alertReason);
+  // --- BLE Communication (G-Force Crash Only) ---
+  if (isCrash && !sosSent) {
+    Serial.println("ALERT: CRASH_DETECTED (High G-Force)");
+    Serial.println(gForce);
+    sendBLEAlert("CRASH_DETECTED");
     sosSent = true;
-  }
-  else if (!isEmergency && sosSent) {
+  } 
+  else if (!isCrash && sosSent) {
     pCharacteristic->setValue("SAFE");
     pCharacteristic->notify();
     sosSent = false;
   }
 
-  return isEmergency;
+  // Return true if either crash or local warning is active (to trigger buzzer/LED)
+  return (localWarning || isCrash);
 }
 
 // ==========================================
